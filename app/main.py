@@ -10,6 +10,7 @@ from .config import settings
 from .dns_server import dns_service
 from .models import (
     PublishResult,
+    ReclaimResult,
     RecordOut,
     VersionOut,
     ZoneOut,
@@ -143,3 +144,50 @@ async def manual_sync() -> dict:
     result = outcome.as_dict()
     result["zone"] = _zone_out().model_dump()
     return result
+
+
+# ------------------------------------------------- version reclaim (both)
+@app.get("/api/versions", tags=["reclaim"])
+def list_versions() -> dict:
+    """Serials of every complete version actually stored on this machine."""
+    return {
+        "role": settings.role,
+        "zone": settings.dns_zone,
+        "active_serial": storage.active_serial(),
+        "serials": storage.list_serials(),
+    }
+
+
+@app.post("/api/reclaim", response_model=ReclaimResult, tags=["reclaim"])
+def reclaim_versions() -> ReclaimResult:
+    """Delete old versions, keeping the active one and the latest old one.
+
+    Available on both roles. Only versions present in this machine's own
+    database are considered, so a backup with gap/skip-number sync keeps
+    the newest old version it actually stored. The active zone is never
+    deleted and publishing/sync never depend on this call; a failure is
+    reported as 500, nothing is removed and the request can be retried.
+    """
+    try:
+        deleted = storage.reclaim_versions()
+    except Exception as exc:  # storage rolls back; active zone untouched
+        log.exception("version reclaim failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"version reclaim failed: {type(exc).__name__}: {exc}",
+        )
+    active = storage.active_serial()
+    retained = storage.list_serials()
+    log.info(
+        "reclaimed old versions deleted=%s retained=%s active=%s",
+        deleted, retained, active,
+    )
+    return ReclaimResult(
+        ok=True,
+        role=settings.role,
+        zone=settings.dns_zone,
+        active_serial=active,
+        retained_serials=retained,
+        deleted_serials=deleted,
+        deleted_count=len(deleted),
+    )

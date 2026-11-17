@@ -6,6 +6,12 @@ serial move together, so an answer can never be assembled from two
 versions. A stale transfer (serial <= active serial) is rejected, which
 guarantees a late/old transfer can never roll back an already active
 version.
+
+Version reclaim (``reclaim_versions``) keeps only the active version and
+the most recent older stored version, deleting the rest in one
+transaction. It never deletes the active row, and every write path is
+serialised by ``_lock``; an in-flight query therefore always reads one
+complete version snapshot and never a row that vanished mid-answer.
 """
 from __future__ import annotations
 
@@ -95,17 +101,41 @@ class Storage:
     def get_active_version(
         self,
     ) -> Tuple[int, List[Dict[str, str]], Optional[str]]:
-        """Return (serial, records, published_at) of one active version."""
+        """Return (serial, records, published_at) of one active version.
+
+        The pointer lookup and the version-row fetch are one SQL statement,
+        so the snapshot is atomic even while version reclaim deletes old
+        rows in a concurrent transaction: a query either sees the whole
+        active row or none of the change, never a pointer whose row was
+        just removed (which would look like a false NXDOMAIN).
+        """
         conn = self._connect()
         try:
-            serial = int(self._get_state(conn, "active_serial") or "0")
             row = conn.execute(
-                "SELECT records_json, published_at FROM zone_versions "
-                "WHERE serial=?",
-                (serial,),
+                "SELECT v.serial AS serial, v.records_json AS records_json, "
+                "v.published_at AS published_at "
+                "FROM zone_versions v "
+                "JOIN state s ON s.key = 'active_serial' "
+                "AND v.serial = CAST(s.value AS INTEGER)"
             ).fetchone()
-            records = json.loads(row["records_json"]) if row else []
-            return serial, records, (row["published_at"] if row else None)
+            if row is None:  # defensive: schema seed always creates serial 0
+                return 0, [], None
+            return (
+                row["serial"],
+                json.loads(row["records_json"]),
+                row["published_at"],
+            )
+        finally:
+            conn.close()
+
+    def list_serials(self) -> List[int]:
+        """Serials of every version actually stored on this machine."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT serial FROM zone_versions ORDER BY serial"
+            ).fetchall()
+            return [row["serial"] for row in rows]
         finally:
             conn.close()
 
@@ -217,6 +247,52 @@ class Storage:
                 )
                 conn.execute("COMMIT")
                 return next_serial, published_at
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+    def reclaim_versions(self) -> List[int]:
+        """Garbage-collect old versions stored on this machine.
+
+        Retention rule: keep the currently active version plus the single
+        most recent older version actually present in this database; every
+        other version row is deleted. On a backup with gap/skip-number
+        syncing, "most recent" means the highest stored serial below the
+        active one, regardless of how many serials are missing.
+
+        The active version and its pointer are never touched, so DNS
+        answers and publish/sync results cannot depend on reclaim. The
+        whole operation is one transaction: on any error it rolls back,
+        all previously active versions keep serving and the call can be
+        retried. Returns the ascending list of deleted serials.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                active = int(
+                    self._get_state(conn, "active_serial") or "0"
+                )
+                stored = [
+                    r["serial"]
+                    for r in conn.execute(
+                        "SELECT serial FROM zone_versions ORDER BY serial"
+                    ).fetchall()
+                ]
+                older = [s for s in stored if s < active]
+                keep = {active}
+                if older:
+                    keep.add(max(older))
+                deleted = [s for s in stored if s not in keep]
+                if deleted:
+                    conn.executemany(
+                        "DELETE FROM zone_versions WHERE serial=?",
+                        [(s,) for s in deleted],
+                    )
+                conn.execute("COMMIT")
+                return deleted
             except Exception:
                 conn.execute("ROLLBACK")
                 raise

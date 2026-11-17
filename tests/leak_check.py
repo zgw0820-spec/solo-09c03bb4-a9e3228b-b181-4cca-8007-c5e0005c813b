@@ -18,6 +18,8 @@ for i in range(1, 51):
     storage.get_sync_state()
     storage.update_sync_state("synced", None, i)
     storage.version_exists(i)
+    storage.list_serials()
+    storage.reclaim_versions()
 
 db_fds = []
 for f in os.listdir("/proc/self/fd"):

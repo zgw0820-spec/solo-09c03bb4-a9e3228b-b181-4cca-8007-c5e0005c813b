@@ -3,7 +3,11 @@
 Every answer is built from one immutable version snapshot fetched in a
 single storage read, so a reply can never mix records of two versions.
 While a transfer is in progress the old version stays active and keeps
-being answered.
+being answered. Version reclaim never removes the active row, and the
+snapshot read is a single atomic SQL statement, so a query racing a
+reclaim either gets the complete active version or none of the change —
+never a false NXDOMAIN from a row deleted mid-answer, and never records
+from a newer version.
 """
 from __future__ import annotations
 
@@ -11,12 +15,25 @@ import logging
 from typing import List
 
 from dnslib import A, DNSRecord, RR, QTYPE, RCODE
-from dnslib.server import BaseResolver, DNSServer
+from dnslib.server import BaseResolver, DNSLogger, DNSServer
 
 from .config import settings
 from .storage import storage
 
 log = logging.getLogger("dns")
+
+
+class _QuietDNSLogger(DNSLogger):
+    """DNSLogger that routes through stdlib logging instead of print.
+
+    The default DNSLogger prints one line per query to stdout, which floods
+    the log under high query rates; send the same lines to the dns logger at
+    DEBUG instead so normal INFO runs stay quiet.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.logf = lambda msg: log.debug(msg)
 
 
 def _normalise(qname: str) -> str:
@@ -79,6 +96,7 @@ class DnsService:
             port=settings.dns_port,
             address=settings.dns_host,
             tcp=False,
+            logger=_QuietDNSLogger(),
         )
         self._server.start_thread()
         log.info(

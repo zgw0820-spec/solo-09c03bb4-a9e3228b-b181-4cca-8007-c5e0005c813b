@@ -99,3 +99,13 @@ class PublishResult(BaseModel):
     serial: int
     record_count: int
     published_at: str
+
+
+class ReclaimResult(BaseModel):
+    ok: bool
+    role: str
+    zone: str
+    active_serial: int
+    retained_serials: List[int]
+    deleted_serials: List[int]
+    deleted_count: int
